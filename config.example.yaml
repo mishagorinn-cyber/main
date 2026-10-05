@@ -1,0 +1,56 @@
+# Copy to config.yaml and fill in. ${VAR} and ${VAR:-default} are read from the environment.
+timezone: Asia/Jerusalem
+
+syrve:
+  base_url: https://api-eu.syrve.live
+  api_login: ${SYRVE_API_LOGIN}
+  # Run `python -m connector discover` to find these ids.
+  organization_id: ${SYRVE_ORGANIZATION_ID}
+  terminal_group_id: ${SYRVE_TERMINAL_GROUP_ID}
+  restaurant_section_ids: []     # empty = all halls of the terminal group
+  consider_open_orders: false    # also treat tables with open orders as busy now
+  customer_type: regular         # regular | one-time
+  should_remind: true
+
+ontopo:
+  base_url: ${ONTOPO_BASE_URL}
+  api_key: ${ONTOPO_API_KEY}
+  venue_id: ${ONTOPO_VENUE_ID}
+  auth_header: Authorization
+  auth_scheme: Bearer
+  availability_path: /venues/{venue_id}/availability
+  reservations_path: /venues/{venue_id}/reservations
+  reservation_status_path: /venues/{venue_id}/reservations/{reservation_id}/pos-status
+  webhook_secret: ${ONTOPO_WEBHOOK_SECRET:-}
+  webhook_signature_header: X-Ontopo-Signature
+  poll_reservations: false
+  poll_interval_seconds: 60
+
+availability:
+  horizon_days: 14
+  slot_minutes: 15
+  default_duration_minutes: 120
+  buffer_minutes: 15
+  last_seating_offset_minutes: 60
+  sync_interval_seconds: 120
+  opening_hours:                 # quote the times
+    default: {open: "12:00", close: "23:00"}
+    fri: {open: "11:00", close: "16:00"}
+    sat: {open: "19:00", close: "01:00"}   # closes after midnight
+    # sun: null                  # closed
+
+reservations:
+  default_duration_minutes: 120
+  auto_assign_tables: true
+  allow_table_combining: false
+  table_map: {}                  # "<ontopo table id>": "<syrve table id>"
+  max_attempts: 8
+  retry_base_seconds: 15
+
+storage:
+  path: data/connector.db
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  admin_token: ${ADMIN_TOKEN:-}
