@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
-WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+ONTOPO_STAGING_URL = "https://top-openapi.staging-01.ontopo.cz"
 
 
 class SyrveConfig(BaseModel):
@@ -23,8 +22,6 @@ class SyrveConfig(BaseModel):
     terminal_group_id: str
     # Empty list = every reservable section of the terminal group.
     restaurant_section_ids: list[str] = Field(default_factory=list)
-    # Treat tables with open (unpaid) orders as busy right now (walk-in guests).
-    consider_open_orders: bool = False
     # "regular" links the reserve to a CRM customer by phone, "one-time" does not.
     customer_type: str = "regular"
     should_remind: bool = True
@@ -35,75 +32,43 @@ class SyrveConfig(BaseModel):
 
 
 class OntopoConfig(BaseModel):
-    base_url: str
-    api_key: str = ""
-    venue_id: str
-    auth_header: str = "Authorization"
-    auth_scheme: str = "Bearer"
-    # Paths are templates; {venue_id} and {reservation_id} are substituted.
-    availability_path: str = "/venues/{venue_id}/availability"
-    reservations_path: str = "/venues/{venue_id}/reservations"
-    # Optional: where to report the POS outcome of a reservation. Empty = disabled.
-    reservation_status_path: str = "/venues/{venue_id}/reservations/{reservation_id}/pos-status"
-    webhook_secret: str = ""
-    webhook_signature_header: str = "X-Ontopo-Signature"
-    # Fallback polling of reservations, in case webhooks are missed.
-    poll_reservations: bool = False
-    poll_interval_seconds: int = 60
+    base_url: str = ONTOPO_STAGING_URL
+    # Venue API key issued by Ontopo, sent as the x-api-key header.
+    api_key: str
+    # Optional shared token for incoming webhooks: accepted as ?token=... or the x-api-key header.
+    webhook_token: str = ""
+    # Safety net for missed webhooks: POST /pos/reservationsForToday.
+    poll_reservations: bool = True
+    poll_interval_seconds: int = Field(300, ge=30)
     request_timeout_seconds: float = 30.0
-
-
-class DayHours(BaseModel):
-    open: time
-    close: time  # close <= open means the venue closes after midnight
-
-    @field_validator("open", "close", mode="before")
-    @classmethod
-    def _yaml_sexagesimal(cls, value):
-        # YAML 1.1 parses an unquoted 12:30 as the base-60 integer 750.
-        if isinstance(value, int):
-            hours, minutes = divmod(value, 60)
-            return time(hours % 24, minutes)
-        return value
-
-
-class AvailabilityConfig(BaseModel):
-    horizon_days: int = Field(14, ge=1, le=90)
-    slot_minutes: int = Field(15, ge=5, le=120)
-    default_duration_minutes: int = Field(120, ge=15)
-    # Cleaning / turnover buffer kept around existing reservations.
-    buffer_minutes: int = Field(15, ge=0)
-    # Last seating is this many minutes before closing.
-    last_seating_offset_minutes: int = Field(60, ge=0)
-    sync_interval_seconds: int = Field(120, ge=10)
-    # Keys: "default" and/or mon..sun. A null value means closed that day.
-    opening_hours: dict[str, DayHours | None] = Field(
-        default_factory=lambda: {"default": DayHours(open=time(12), close=time(23))}
-    )
-
-    @field_validator("opening_hours")
-    @classmethod
-    def _check_keys(cls, value: dict[str, DayHours | None]) -> dict[str, DayHours | None]:
-        unknown = set(value) - set(WEEKDAYS) - {"default"}
-        if unknown:
-            raise ValueError(f"unknown opening_hours keys: {sorted(unknown)}")
-        return value
-
-    def hours_for(self, weekday: int) -> DayHours | None:
-        key = WEEKDAYS[weekday]
-        if key in self.opening_hours:
-            return self.opening_hours[key]
-        return self.opening_hours.get("default")
 
 
 class ReservationsConfig(BaseModel):
     default_duration_minutes: int = Field(120, ge=15)
-    # Ontopo table id -> Syrve table id. Tables can also be matched by number/name.
+    # Turnover buffer kept between reserves on the same table when auto-assigning.
+    buffer_minutes: int = Field(15, ge=0)
+    # Ontopo table label -> Syrve table (id, number or name). Unmapped labels are
+    # matched to Syrve tables by number, then by name.
     table_map: dict[str, str] = Field(default_factory=dict)
     auto_assign_tables: bool = True
     allow_table_combining: bool = False
+    # Send the table chosen in Syrve back to Ontopo when it differs from Ontopo's.
+    report_assigned_tables: bool = True
     max_attempts: int = Field(8, ge=1)
     retry_base_seconds: int = Field(15, ge=1)
+
+
+class OrdersConfig(BaseModel):
+    """Syrve table orders -> Ontopo (this is how Ontopo learns which tables are taken)."""
+
+    enabled: bool = True
+    sync_interval_seconds: int = Field(30, ge=5)
+    # An order opened on a reserved table from N minutes before the reservation
+    # until its end is treated as that reservation's guests arriving.
+    early_arrival_minutes: int = Field(45, ge=0)
+    # Orders that match no Ontopo reservation are sent as POS-created (walk-in) reservations.
+    create_walk_ins: bool = True
+    include_items: bool = True
 
 
 class StorageConfig(BaseModel):
@@ -113,7 +78,7 @@ class StorageConfig(BaseModel):
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
-    # If set, /admin/* endpoints require the X-Admin-Token header.
+    # If set, /status and /admin/* require the X-Admin-Token header.
     admin_token: str = ""
 
 
@@ -121,8 +86,8 @@ class Settings(BaseModel):
     timezone: str = "Asia/Jerusalem"
     syrve: SyrveConfig
     ontopo: OntopoConfig
-    availability: AvailabilityConfig = Field(default_factory=AvailabilityConfig)
     reservations: ReservationsConfig = Field(default_factory=ReservationsConfig)
+    orders: OrdersConfig = Field(default_factory=OrdersConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
 

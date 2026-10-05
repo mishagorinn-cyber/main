@@ -1,23 +1,40 @@
-"""Translation between Ontopo payloads and the connector's domain models.
+"""Ontopo POS API data model (SyncData) <-> connector domain models.
 
-Ontopo does not publish its partner (POS) API, so the wire format below is
-the connector's documented contract (see README, "Ontopo contract"). All
-field names Ontopo might use live in this one module: when Ontopo hands over
-its integration spec, adjust the functions here and nothing else.
+Spec: "Ontopo POS API Integration Specification".
 
-Parsing accepts both camelCase and snake_case keys.
+SyncData   {syncId, syncAt (ISO 8601), order?, reservation}
+Reservation{reservationId, duration (min), expectedDate "YYYYMMDD", expectedTime "HHmm",
+            patron, size, status, table: string[], seatingRequests: string[]}
+Order      {posOrderId, orderNumber, openedAt (ISO 8601), netTotal, discountAmount,
+            dinnersCount, stage, tables: number[], items: [{itemId, itemName, quantity, price}]}
+ReservationStatus: approved | seated | canceled | noShow | done | standby
+ReservationStage:  preOrder | ordered | starters | main | check | paid
+
+The spec does not define the Patron object, so several common field names are accepted.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..config import Settings
-from ..models import AvailabilitySlot, Guest, InboundReservation, ReservationState, Table
+from ..models import Guest, InboundReservation, ReservationState
 
-CANCELLED_STATUSES = {"cancelled", "canceled", "rejected", "deleted", "no_show", "noshow", "declined", "expired"}
+STATUS_APPROVED = "approved"
+STATUS_SEATED = "seated"
+STATUS_CANCELED = "canceled"
+STATUS_NO_SHOW = "noShow"
+STATUS_DONE = "done"
+STATUS_STANDBY = "standby"
+
+STAGE_ORDERED = "ordered"
+STAGE_CHECK = "check"
+STAGE_PAID = "paid"
+
+# A waiting-list party has no table, so it must not hold one in Syrve.
+_RELEASE_TABLE = {STATUS_CANCELED.lower(), "cancelled", STATUS_NO_SHOW.lower(), STATUS_STANDBY}
 
 
 class PayloadError(ValueError):
@@ -26,114 +43,104 @@ class PayloadError(ValueError):
 
 def _get(data: dict, *names: str, default: Any = None) -> Any:
     for name in names:
-        if name in data and data[name] is not None:
+        if name in data and data[name] not in (None, ""):
             return data[name]
     return default
 
 
-def _to_local(value: str, tz: ZoneInfo) -> datetime:
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (AttributeError, ValueError) as exc:
-        raise PayloadError(f"invalid datetime: {value!r}") from exc
-    if dt.tzinfo is None:  # already local
-        return dt.replace(second=0, microsecond=0)
-    return dt.astimezone(tz).replace(tzinfo=None, second=0, microsecond=0)
+def iso(value: datetime, tz: ZoneInfo) -> str:
+    """Local naive (or aware) datetime -> ISO 8601 with the venue offset."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=tz)
+    return value.astimezone(tz).isoformat(timespec="seconds")
 
 
-def _iso_local(value: datetime, tz: ZoneInfo) -> str:
-    return value.replace(tzinfo=tz).isoformat()
-
-
-# --------------------------------------------------------------------- inbound
-
-
-def unwrap_event(payload: dict) -> tuple[str, dict]:
-    """Return (event type, reservation dict) from a webhook body."""
+def parse_sync_id(payload: Any) -> str:
     if not isinstance(payload, dict):
-        raise PayloadError("payload must be a JSON object")
-    event = str(_get(payload, "event", "type", "eventType", default="reservation.updated"))
-    reservation = _get(payload, "reservation", "data", "booking")
-    if reservation is None and _get(payload, "id", "reservationId", "reservation_id"):
-        reservation = payload  # bare reservation object
-    if not isinstance(reservation, dict):
-        raise PayloadError("no reservation object in payload")
-    return event, reservation
+        raise PayloadError("SyncData must be a JSON object")
+    sync_id = payload.get("syncId")
+    if not sync_id:
+        raise PayloadError("syncId is missing")
+    return str(sync_id)
 
 
-def parse_reservation(data: dict, settings: Settings, event: str = "") -> InboundReservation:
-    tz = settings.tz
-    res_id = _get(data, "id", "reservationId", "reservation_id")
-    if not res_id:
-        raise PayloadError("reservation id is missing")
-
-    raw_status = str(_get(data, "status", "state", default="confirmed")).lower()
-    cancelled = raw_status in CANCELLED_STATUSES or event.endswith((".cancelled", ".canceled", ".deleted"))
-
-    start_raw = _get(data, "start", "startTime", "start_time", "dateTime", "datetime", "time")
-    if not start_raw:
-        date_part, time_part = _get(data, "date"), _get(data, "hour", "timeOfDay")
-        if date_part and time_part:
-            start_raw = f"{date_part}T{time_part}"
-    if not start_raw:
-        raise PayloadError("reservation start time is missing")
-    start = _to_local(str(start_raw), tz)
-
-    duration = _get(data, "durationMinutes", "duration_minutes", "duration")
-    end_raw = _get(data, "end", "endTime", "end_time")
-    if duration is None and end_raw:
-        duration = int((_to_local(str(end_raw), tz) - start) / timedelta(minutes=1))
-
-    party = _get(data, "partySize", "party_size", "guests", "size", "covers", default=0)
-    if isinstance(party, dict):
-        party = _get(party, "count", "total", default=0)
+def parse_start(reservation: dict) -> datetime | None:
+    date_raw, time_raw = reservation.get("expectedDate"), reservation.get("expectedTime")
+    if not date_raw or not time_raw:
+        return None
+    date_s, time_s = str(date_raw).replace("-", ""), str(time_raw).replace(":", "").zfill(4)
     try:
-        party = int(party)
-    except (TypeError, ValueError) as exc:
-        raise PayloadError(f"invalid party size: {party!r}") from exc
-    if party <= 0 and not cancelled:
-        raise PayloadError("party size must be positive")
+        return datetime.strptime(date_s + time_s[:4], "%Y%m%d%H%M")
+    except ValueError as exc:
+        raise PayloadError(f"invalid expectedDate/expectedTime: {date_raw!r} {time_raw!r}") from exc
 
-    g = _get(data, "guest", "customer", "contact", default={}) or {}
-    first = _get(g, "firstName", "first_name", default="")
-    last = _get(g, "lastName", "last_name", default="")
+
+def parse_patron(patron: Any) -> Guest:
+    if not isinstance(patron, dict):
+        return Guest()
+    first = _get(patron, "firstName", "first_name", "fname", default="")
+    last = _get(patron, "lastName", "last_name", "lname", default="")
     if not first and not last:
-        first = _get(g, "name", "fullName", "full_name", default="")
-    guest = Guest(
+        first = _get(patron, "name", "fullName", "full_name", "displayName", default="")
+    phone = _get(patron, "phone", "phoneNumber", "phone_number", "mobile", "cellphone", default="")
+    return Guest(
         first_name=str(first).strip(),
         last_name=str(last).strip(),
-        phone=normalize_phone(str(_get(g, "phone", "phoneNumber", "phone_number", "mobile", default=""))),
-        email=str(_get(g, "email", default="")).strip(),
+        phone=normalize_phone(str(phone)),
+        email=str(_get(patron, "email", default="")).strip(),
     )
 
-    tables = _get(data, "tableIds", "table_ids", "tables", default=[]) or []
-    table_ids = [str(t.get("id") if isinstance(t, dict) else t) for t in tables]
 
-    updated_raw = _get(data, "updatedAt", "updated_at", "modifiedAt")
-    updated = _to_local(str(updated_raw), tz) if updated_raw else None
+def parse_sync_data(payload: Any) -> InboundReservation:
+    sync_id = parse_sync_id(payload)
+    reservation = payload.get("reservation") or {}
+    if not isinstance(reservation, dict):
+        raise PayloadError("reservation must be an object")
+
+    raw_status = str(reservation.get("status") or STATUS_APPROVED)
+    status_key = raw_status.lower()
+    if status_key in _RELEASE_TABLE:
+        state = ReservationState.CANCELLED
+    elif status_key == STATUS_DONE:
+        state = ReservationState.DONE
+    else:  # approved, seated
+        state = ReservationState.ACTIVE
+
+    start = parse_start(reservation)
+    if state is ReservationState.ACTIVE and start is None:
+        raise PayloadError("expectedDate/expectedTime are missing")
+
+    try:
+        size = int(reservation.get("size") or 0)
+        duration = int(reservation["duration"]) if reservation.get("duration") else None
+    except (TypeError, ValueError) as exc:
+        raise PayloadError(f"invalid size/duration: {exc}") from exc
+    if state is ReservationState.ACTIVE and size <= 0:
+        raise PayloadError("size must be positive")
 
     return InboundReservation(
-        id=str(res_id),
-        state=ReservationState.CANCELLED if cancelled else ReservationState.ACTIVE,
-        start=start,
-        party_size=party,
-        duration_minutes=int(duration) if duration else None,
-        guest=guest,
-        notes=str(_get(data, "notes", "comment", "comments", "specialRequests", default="")).strip(),
-        table_ids=table_ids,
+        sync_id=sync_id,
+        reservation_id=str(reservation.get("reservationId") or ""),
+        state=state,
         raw_status=raw_status,
-        updated_at=updated,
+        start=start,
+        party_size=size,
+        duration_minutes=duration,
+        guest=parse_patron(reservation.get("patron")),
+        table_labels=[str(t) for t in reservation.get("table") or []],
+        seating_requests=[str(s) for s in reservation.get("seatingRequests") or []],
+        raw=reservation,
     )
 
 
-def parse_reservation_list(payload: Any) -> list[dict]:
+def parse_sync_list(payload: Any) -> list[dict]:
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
-        items = _get(payload, "reservations", "items", "data", default=[])
-        if isinstance(items, list):
-            return items
-    raise PayloadError("unexpected reservations list format")
+        for key in ("data", "reservations", "items"):
+            if isinstance(payload.get(key), list):
+                return payload[key]
+    raise PayloadError("unexpected reservationsForToday response format")
 
 
 def normalize_phone(phone: str) -> str:
@@ -150,52 +157,8 @@ def normalize_phone(phone: str) -> str:
     return "+" + digits
 
 
-# -------------------------------------------------------------------- outbound
-
-
-def build_availability_payload(
-    settings: Settings, tables: list[Table], slots: list[AvailabilitySlot], generated_at: datetime
-) -> dict:
-    tz = settings.tz
-    capacity = {t.id: t.capacity for t in tables}
-    return {
-        "venueId": settings.ontopo.venue_id,
-        "source": "syrve",
-        "timezone": settings.timezone,
-        "generatedAt": _iso_local(generated_at, tz),
-        "slotMinutes": settings.availability.slot_minutes,
-        "defaultDurationMinutes": settings.availability.default_duration_minutes,
-        "tables": [
-            {
-                "id": t.id,
-                "number": t.number,
-                "name": t.name,
-                "capacity": t.capacity,
-                "areaId": t.section_id,
-                "areaName": t.section_name,
-            }
-            for t in tables
-        ],
-        "slots": [
-            {
-                "start": _iso_local(s.start, tz),
-                "freeTableIds": list(s.free_table_ids),
-                "freeSeats": sum(capacity.get(t, 0) for t in s.free_table_ids),
-                "maxPartySize": max((capacity.get(t, 0) for t in s.free_table_ids), default=0),
-            }
-            for s in slots
-        ],
-    }
-
-
-def build_status_payload(
-    reservation_id: str, status: str, syrve_reserve_id: str = "", tables: list[Table] | None = None, message: str = ""
-) -> dict:
-    """Report back to Ontopo what happened on the POS ("confirmed" / "rejected" / "cancelled")."""
-    return {
-        "reservationId": reservation_id,
-        "status": status,
-        "posReservationId": syrve_reserve_id or None,
-        "tables": [{"id": t.id, "name": t.name, "number": t.number} for t in (tables or [])],
-        "message": message or None,
-    }
+def build_sync_data(sync_id: str, sync_at: datetime, tz: ZoneInfo, reservation: dict, order: dict | None = None) -> dict:
+    body = {"syncId": sync_id, "syncAt": iso(sync_at, tz), "reservation": reservation}
+    if order is not None:
+        body["order"] = order
+    return body

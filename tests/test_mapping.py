@@ -1,64 +1,75 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
 from connector.models import ReservationState
-from connector.ontopo.mapping import PayloadError, normalize_phone, parse_reservation, unwrap_event
+from connector.ontopo.mapping import PayloadError, build_sync_data, normalize_phone, parse_sync_data
 
 from .fakes import make_settings
 
 S = make_settings()
 
 
-def test_parse_camel_case_with_timezone_conversion():
-    event, data = unwrap_event(
-        {
-            "event": "reservation.created",
-            "reservation": {
-                "id": "R1",
-                "status": "confirmed",
-                "startTime": "2030-01-07T17:00:00Z",
-                "partySize": 4,
-                "guest": {"firstName": "Dana", "lastName": "Levi", "phone": "050-123-4567"},
-                "notes": "window seat",
-                "tableIds": ["A1"],
-            },
-        }
-    )
-    res = parse_reservation(data, S, event)
-    assert res.start == datetime(2030, 1, 7, 19, 0)  # UTC+2 in January
-    assert res.party_size == 4
-    assert res.guest.phone == "+972501234567"
-    assert res.guest.full_name == "Dana Levi"
-    assert res.table_ids == ["A1"]
+def sync(status="approved", **reservation):
+    base = {
+        "reservationId": "ba788d3f",
+        "duration": 120,
+        "expectedDate": "20250806",
+        "expectedTime": "1830",
+        "patron": {"firstName": "Dana", "lastName": "Levi", "phone": "050-123-4567"},
+        "size": 6,
+        "status": status,
+        "table": ["5", "6"],
+        "seatingRequests": ["bar"],
+    }
+    base.update(reservation)
+    return {"syncId": "S1", "syncAt": "2025-08-06T10:00:00Z", "reservation": base}
+
+
+def test_parse_spec_example():
+    res = parse_sync_data(sync())
+    assert res.sync_id == "S1" and res.reservation_id == "ba788d3f"
+    assert res.start == datetime(2025, 8, 6, 18, 30)
+    assert res.party_size == 6 and res.duration_minutes == 120
+    assert res.table_labels == ["5", "6"] and res.seating_requests == ["bar"]
+    assert res.guest.full_name == "Dana Levi" and res.guest.phone == "+972501234567"
     assert res.state is ReservationState.ACTIVE
 
 
-def test_parse_snake_case_end_time_and_cancel_event():
-    event, data = unwrap_event(
-        {
-            "type": "reservation.cancelled",
-            "data": {
-                "reservation_id": "R2",
-                "start_time": "2030-01-07T19:00:00+02:00",
-                "end_time": "2030-01-07T20:30:00+02:00",
-                "guests": {"count": 2},
-                "customer": {"name": "Avi"},
-            },
-        }
-    )
-    res = parse_reservation(data, S, event)
-    assert res.duration_minutes == 90
-    assert res.party_size == 2
-    assert res.guest.first_name == "Avi"
-    assert res.state is ReservationState.CANCELLED
+@pytest.mark.parametrize(
+    "status,state",
+    [
+        ("approved", ReservationState.ACTIVE),
+        ("seated", ReservationState.ACTIVE),
+        ("canceled", ReservationState.CANCELLED),
+        ("noShow", ReservationState.CANCELLED),
+        ("standby", ReservationState.CANCELLED),
+        ("done", ReservationState.DONE),
+    ],
+)
+def test_status_mapping(status, state):
+    assert parse_sync_data(sync(status)).state is state
 
 
-def test_missing_fields_raise():
+def test_patron_with_single_name_field():
+    res = parse_sync_data(sync(patron={"name": "Avi", "phone": "+44 7700 900123"}))
+    assert res.guest.first_name == "Avi" and res.guest.phone == "+447700900123"
+
+
+def test_invalid_payloads():
     with pytest.raises(PayloadError):
-        parse_reservation({"id": "R3", "partySize": 2}, S)
+        parse_sync_data({"reservation": {}})  # no syncId
     with pytest.raises(PayloadError):
-        unwrap_event({"event": "x"})
+        parse_sync_data(sync(expectedDate=None))
+    with pytest.raises(PayloadError):
+        parse_sync_data(sync(expectedTime="25:99"))
+    # a cancellation does not need date or size
+    assert parse_sync_data(sync("canceled", expectedDate=None, size=0)).state is ReservationState.CANCELLED
+
+
+def test_build_sync_data_uses_venue_offset():
+    body = build_sync_data("S1", datetime(2030, 1, 7, 17, 0, tzinfo=timezone.utc), S.tz, {"status": "seated"})
+    assert body == {"syncId": "S1", "syncAt": "2030-01-07T19:00:00+02:00", "reservation": {"status": "seated"}}
 
 
 @pytest.mark.parametrize(

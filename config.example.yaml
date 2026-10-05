@@ -8,44 +8,34 @@ syrve:
   organization_id: ${SYRVE_ORGANIZATION_ID}
   terminal_group_id: ${SYRVE_TERMINAL_GROUP_ID}
   restaurant_section_ids: []     # empty = all halls of the terminal group
-  consider_open_orders: false    # also treat tables with open orders as busy now
   customer_type: regular         # regular | one-time
   should_remind: true
 
 ontopo:
-  base_url: ${ONTOPO_BASE_URL}
-  api_key: ${ONTOPO_API_KEY}
-  venue_id: ${ONTOPO_VENUE_ID}
-  auth_header: Authorization
-  auth_scheme: Bearer
-  availability_path: /venues/{venue_id}/availability
-  reservations_path: /venues/{venue_id}/reservations
-  reservation_status_path: /venues/{venue_id}/reservations/{reservation_id}/pos-status
-  webhook_secret: ${ONTOPO_WEBHOOK_SECRET:-}
-  webhook_signature_header: X-Ontopo-Signature
-  poll_reservations: false
-  poll_interval_seconds: 60
-
-availability:
-  horizon_days: 14
-  slot_minutes: 15
-  default_duration_minutes: 120
-  buffer_minutes: 15
-  last_seating_offset_minutes: 60
-  sync_interval_seconds: 120
-  opening_hours:                 # quote the times
-    default: {open: "12:00", close: "23:00"}
-    fri: {open: "11:00", close: "16:00"}
-    sat: {open: "19:00", close: "01:00"}   # closes after midnight
-    # sun: null                  # closed
+  # Staging; replace with the production URL Ontopo gives you.
+  base_url: ${ONTOPO_BASE_URL:-https://top-openapi.staging-01.ontopo.cz}
+  api_key: ${ONTOPO_API_KEY}     # venue key, sent as x-api-key
+  # Optional: register the webhook as https://<host>/webhooks/ontopo?token=<this value>
+  webhook_token: ${ONTOPO_WEBHOOK_TOKEN:-}
+  poll_reservations: true        # re-read /pos/reservationsForToday as a safety net
+  poll_interval_seconds: 300
 
 reservations:
-  default_duration_minutes: 120
+  default_duration_minutes: 120  # when Ontopo sends no duration
+  buffer_minutes: 15
   auto_assign_tables: true
   allow_table_combining: false
-  table_map: {}                  # "<ontopo table id>": "<syrve table id>"
+  report_assigned_tables: true   # tell Ontopo which table Syrve got
+  table_map: {}                  # "<ontopo table>": "<syrve table number, name or id>"
   max_attempts: 8
   retry_base_seconds: 15
+
+orders:
+  enabled: true                  # Syrve table orders -> Ontopo (seated / done / walk-ins)
+  sync_interval_seconds: 30
+  early_arrival_minutes: 45
+  create_walk_ins: true
+  include_items: true
 
 storage:
   path: data/connector.db

@@ -10,7 +10,7 @@ Only the endpoints needed for table reservations are wrapped:
 * POST /api/1/reserve/create
 * POST /api/1/reserve/cancel
 * POST /api/1/reserve/status_by_id
-* POST /api/1/order/by_table            (optional, open orders on tables)
+* POST /api/1/order/by_table            (orders on tables -> table occupancy in Ontopo)
 
 Syrve exchanges local restaurant time as "yyyy-MM-dd HH:mm:ss.fff".
 """
@@ -174,18 +174,25 @@ class SyrveClient:
             )
         return intervals
 
-    async def open_orders_on_tables(self, table_ids: list[str], since: datetime) -> list[dict]:
-        """Unclosed orders on tables (guests currently seated). Returns raw order dicts."""
-        data = await self._post(
-            "/api/1/order/by_table",
-            {
-                "organizationIds": [self.config.organization_id],
-                "tableIds": table_ids,
-                "statuses": ["New", "Bill"],
-                "dateFrom": format_syrve_time(since),
-            },
-        )
-        return [o.get("order") or {} for o in data.get("orders", []) if o.get("order")]
+    async def table_orders(
+        self, table_ids: list[str], date_from: datetime, statuses: list[str] | None = None
+    ) -> list[dict]:
+        """Orders on tables since date_from. Each item is the order dict with the order "id" filled in."""
+        body: dict[str, Any] = {
+            "organizationIds": [self.config.organization_id],
+            "tableIds": table_ids,
+            "dateFrom": format_syrve_time(date_from),
+        }
+        if statuses:
+            body["statuses"] = statuses
+        data = await self._post("/api/1/order/by_table", body)
+        result = []
+        for wrapper in data.get("orders", []):
+            order = wrapper.get("order")
+            if not order:  # creation still in progress or failed
+                continue
+            result.append({**order, "id": wrapper.get("id") or order.get("id")})
+        return result
 
     # ------------------------------------------------------------------ reserves
 

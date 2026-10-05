@@ -28,14 +28,8 @@ def make_settings(**overrides) -> Settings:
             "terminal_group_id": "tg-1",
             "creation_poll_interval_seconds": 0,
         },
-        "ontopo": {"base_url": "https://ontopo.test", "api_key": "key", "venue_id": "venue-1"},
-        "availability": {
-            "slot_minutes": 30,
-            "default_duration_minutes": 120,
-            "buffer_minutes": 0,
-            "last_seating_offset_minutes": 120,
-            "opening_hours": {"default": {"open": "18:00", "close": "23:00"}},
-        },
+        "ontopo": {"base_url": "https://ontopo.test", "api_key": "key"},
+        "reservations": {"buffer_minutes": 0},
         "storage": {"path": ":memory:"},
     }
     for key, value in overrides.items():
@@ -53,6 +47,7 @@ class FakeSyrve:
         self.token_requests = 0
         self.reject_next_create: str | None = None
         self.expire_token = False
+        self.orders: dict[str, dict] = {}
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
@@ -66,6 +61,20 @@ class FakeSyrve:
             "status": "Success",
             "cancelled": False,
         }
+
+    def add_order(self, order_id: str, table_ids: list[str], opened: datetime, status: str = "New", **extra) -> dict:
+        order = {
+            "tableIds": table_ids,
+            "status": status,
+            "whenCreated": opened.strftime("%Y-%m-%d %H:%M:%S.000"),
+            "number": len(self.orders) + 100,
+            "sum": 0,
+            "guestsInfo": {"count": 2},
+            "items": [],
+        }
+        order.update(extra)
+        self.orders[order_id] = order
+        return order
 
     def active(self) -> list[dict]:
         return [r for r in self.reserves.values() if not r["cancelled"]]
@@ -119,6 +128,13 @@ class FakeSyrve:
                         info["errorInfo"] = {"message": r["error"]}
                     out.append(info)
             return httpx.Response(200, json={"reserves": out})
+        if path == "/api/1/order/by_table":
+            out = [
+                {"id": oid, "creationStatus": "Success", "order": dict(o)}
+                for oid, o in self.orders.items()
+                if set(o["tableIds"]) & set(body["tableIds"]) and o["status"] in body.get("statuses", [o["status"]])
+            ]
+            return httpx.Response(200, json={"orders": out})
         if path == "/api/1/reserve/cancel":
             r = self.reserves.get(body["reserveId"])
             if not r:
@@ -130,24 +146,31 @@ class FakeSyrve:
 
 
 class FakeOntopo:
+    """Ontopo POS API: /pos/setReservation and /pos/reservationsForToday."""
+
     def __init__(self):
-        self.availability: list[dict] = []
-        self.statuses: list[dict] = []
-        self.reservations: list[dict] = []
+        self.sent: list[dict] = []  # SyncData bodies received on /pos/setReservation
+        self.today: list[dict] = []
         self.requests: list[httpx.Request] = []
+        self.fail_set_reservation = False
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if request.headers.get("x-api-key") != "key":
+            return httpx.Response(401, json={"error": "bad key"})
         path = request.url.path
-        if request.method == "PUT" and path == "/venues/venue-1/availability":
-            self.availability.append(json.loads(request.content))
-            return httpx.Response(204)
-        if request.method == "POST" and path.endswith("/pos-status"):
-            self.statuses.append(json.loads(request.content))
-            return httpx.Response(200, json={})
-        if request.method == "GET" and path == "/venues/venue-1/reservations":
-            return httpx.Response(200, json={"reservations": self.reservations})
+        if request.method == "POST" and path == "/pos/setReservation":
+            if self.fail_set_reservation:
+                return httpx.Response(500, json={"error": "boom"})
+            body = json.loads(request.content)
+            self.sent.append(body)
+            reservation = dict(body.get("reservation") or {})
+            if not reservation.get("reservationId"):
+                reservation["reservationId"] = "ont-" + body["syncId"]
+            return httpx.Response(200, json={**body, "reservation": reservation})
+        if request.method == "POST" and path == "/pos/reservationsForToday":
+            return httpx.Response(200, json=self.today)
         return httpx.Response(404)

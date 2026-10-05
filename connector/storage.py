@@ -1,11 +1,11 @@
-"""SQLite persistence: webhook inbox, Ontopo<->Syrve reservation mapping, key/value meta."""
+"""SQLite persistence: webhook inbox, syncId <-> Syrve links, key/value meta."""
 
 from __future__ import annotations
 
 import json
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,8 +16,8 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 CREATE TABLE IF NOT EXISTS events (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    reservation_id  TEXT NOT NULL,
-    event_type      TEXT NOT NULL,
+    sync_id         TEXT NOT NULL,
+    source          TEXT NOT NULL,                   -- webhook | poll
     payload         TEXT NOT NULL,
     received_at     TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed
@@ -26,17 +26,24 @@ CREATE TABLE IF NOT EXISTS events (
     last_error      TEXT
 );
 CREATE INDEX IF NOT EXISTS events_due ON events (status, next_attempt_at);
-CREATE TABLE IF NOT EXISTS reservations (
-    ontopo_id        TEXT PRIMARY KEY,
-    syrve_reserve_id TEXT,
-    state            TEXT NOT NULL,          -- active | cancelled | failed
-    fingerprint      TEXT,
-    start            TEXT,
-    party_size       INTEGER,
-    table_ids        TEXT,
-    error            TEXT,
-    updated_at       TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS links (
+    sync_id               TEXT PRIMARY KEY,
+    origin                TEXT NOT NULL,   -- ontopo (reservation made in Ontopo) | pos (walk-in order)
+    state                 TEXT NOT NULL,   -- active | cancelled | done | failed
+    ontopo_reservation_id TEXT,
+    ontopo_reservation    TEXT,            -- last reservation object seen, JSON
+    syrve_reserve_id      TEXT,
+    syrve_order_id        TEXT,
+    fingerprint           TEXT,
+    start                 TEXT,
+    duration_minutes      INTEGER,
+    party_size            INTEGER,
+    table_ids             TEXT,            -- Syrve table ids, JSON
+    order_digest          TEXT,            -- last order state sent to Ontopo
+    error                 TEXT,
+    updated_at            TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS links_order ON links (syrve_order_id);
 """
 
 
@@ -47,23 +54,37 @@ def _utcnow() -> str:
 @dataclass
 class Event:
     id: int
-    reservation_id: str
-    event_type: str
+    sync_id: str
+    source: str
     payload: dict
     attempts: int
 
 
 @dataclass
-class ReservationLink:
-    ontopo_id: str
-    syrve_reserve_id: str | None
+class Link:
+    sync_id: str
+    origin: str
     state: str
-    fingerprint: str | None
-    start: str | None
-    party_size: int | None
-    table_ids: list[str]
-    error: str | None
-    updated_at: str
+    ontopo_reservation_id: str | None = None
+    ontopo_reservation: dict = field(default_factory=dict)
+    syrve_reserve_id: str | None = None
+    syrve_order_id: str | None = None
+    fingerprint: str | None = None
+    start: datetime | None = None
+    duration_minutes: int | None = None
+    party_size: int | None = None
+    table_ids: list[str] = field(default_factory=list)
+    order_digest: str | None = None
+    error: str | None = None
+    updated_at: str = ""
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["start"] = self.start.isoformat() if self.start else None
+        return d
+
+
+_LINK_FIELDS = [f.name for f in fields(Link)]
 
 
 class Store:
@@ -99,35 +120,30 @@ class Store:
 
     # ---------------------------------------------------------------- inbox
 
-    def enqueue(self, reservation_id: str, event_type: str, payload: dict) -> int:
+    def enqueue(self, sync_id: str, source: str, payload: dict) -> int:
         now = _utcnow()
         cur = self._exec(
-            "INSERT INTO events (reservation_id, event_type, payload, received_at, next_attempt_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (reservation_id, event_type, json.dumps(payload), now, now),
+            "INSERT INTO events (sync_id, source, payload, received_at, next_attempt_at) VALUES (?, ?, ?, ?, ?)",
+            (sync_id, source, json.dumps(payload), now, now),
         )
         return int(cur.lastrowid)
 
     def due_events(self, limit: int = 50) -> list[Event]:
         """Pending events whose retry time has come, oldest first.
 
-        Only the oldest pending event of each reservation is returned so that
-        events for one reservation are always applied in order.
+        Only the oldest pending event of each syncId is returned so that the
+        updates of one reservation are always applied in order.
         """
         rows = self._exec(
             """
             SELECT e.* FROM events e
             WHERE e.status = 'pending' AND e.next_attempt_at <= ?
-              AND e.id = (SELECT MIN(id) FROM events p
-                          WHERE p.reservation_id = e.reservation_id AND p.status = 'pending')
+              AND e.id = (SELECT MIN(id) FROM events p WHERE p.sync_id = e.sync_id AND p.status = 'pending')
             ORDER BY e.id LIMIT ?
             """,
             (_utcnow(), limit),
         ).fetchall()
-        return [
-            Event(r["id"], r["reservation_id"], r["event_type"], json.loads(r["payload"]), r["attempts"])
-            for r in rows
-        ]
+        return [Event(r["id"], r["sync_id"], r["source"], json.loads(r["payload"]), r["attempts"]) for r in rows]
 
     def mark_done(self, event_id: int) -> None:
         self._exec("UPDATE events SET status = 'done', last_error = NULL WHERE id = ?", (event_id,))
@@ -152,68 +168,93 @@ class Store:
 
     def failed_events(self, limit: int = 50) -> list[dict]:
         rows = self._exec(
-            "SELECT id, reservation_id, event_type, attempts, last_error, received_at FROM events"
+            "SELECT id, sync_id, source, attempts, last_error, received_at FROM events"
             " WHERE status = 'failed' ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
 
-    # ---------------------------------------------------------------- mapping
+    def purge_done_events(self, older_than_days: int = 14) -> int:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+        return self._exec("DELETE FROM events WHERE status = 'done' AND received_at < ?", (cutoff,)).rowcount
 
-    def get_link(self, ontopo_id: str) -> ReservationLink | None:
-        row = self._exec("SELECT * FROM reservations WHERE ontopo_id = ?", (ontopo_id,)).fetchone()
+    # ---------------------------------------------------------------- links
+
+    def get_link(self, sync_id: str) -> Link | None:
+        row = self._exec("SELECT * FROM links WHERE sync_id = ?", (sync_id,)).fetchone()
         return self._link(row) if row else None
 
-    def save_link(
-        self,
-        ontopo_id: str,
-        *,
-        state: str,
-        syrve_reserve_id: str | None = None,
-        fingerprint: str | None = None,
-        start: datetime | None = None,
-        party_size: int | None = None,
-        table_ids: list[str] | None = None,
-        error: str | None = None,
-    ) -> None:
-        self._exec(
-            """
-            INSERT INTO reservations
-                (ontopo_id, syrve_reserve_id, state, fingerprint, start, party_size, table_ids, error, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(ontopo_id) DO UPDATE SET
-                syrve_reserve_id = excluded.syrve_reserve_id, state = excluded.state,
-                fingerprint = excluded.fingerprint, start = excluded.start,
-                party_size = excluded.party_size, table_ids = excluded.table_ids,
-                error = excluded.error, updated_at = excluded.updated_at
-            """,
-            (
-                ontopo_id,
-                syrve_reserve_id,
-                state,
-                fingerprint,
-                start.isoformat() if start else None,
-                party_size,
-                json.dumps(table_ids or []),
-                error,
-                _utcnow(),
-            ),
-        )
+    def link_for_order(self, order_id: str) -> Link | None:
+        row = self._exec("SELECT * FROM links WHERE syrve_order_id = ?", (order_id,)).fetchone()
+        return self._link(row) if row else None
 
-    def recent_links(self, limit: int = 50) -> list[ReservationLink]:
-        rows = self._exec("SELECT * FROM reservations ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+    def links_starting_between(self, start: datetime, end: datetime) -> list[Link]:
+        rows = self._exec(
+            "SELECT * FROM links WHERE origin = 'ontopo' AND start >= ? AND start <= ?",
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+        return [self._link(r) for r in rows]
+
+    def open_order_links(self) -> list[Link]:
+        rows = self._exec(
+            "SELECT * FROM links WHERE syrve_order_id IS NOT NULL AND state = 'active'"
+        ).fetchall()
+        return [self._link(r) for r in rows]
+
+    def update_link(self, sync_id: str, **changes) -> Link:
+        """Insert or merge fields into the link for sync_id."""
+        link = self.get_link(sync_id) or Link(sync_id=sync_id, origin=changes.get("origin", "ontopo"), state="active")
+        for key, value in changes.items():
+            if key not in _LINK_FIELDS:
+                raise KeyError(key)
+            setattr(link, key, value)
+        link.updated_at = _utcnow()
+        values = [
+            link.sync_id,
+            link.origin,
+            link.state,
+            link.ontopo_reservation_id,
+            json.dumps(link.ontopo_reservation or {}),
+            link.syrve_reserve_id,
+            link.syrve_order_id,
+            link.fingerprint,
+            link.start.isoformat() if link.start else None,
+            link.duration_minutes,
+            link.party_size,
+            json.dumps(link.table_ids or []),
+            link.order_digest,
+            link.error,
+            link.updated_at,
+        ]
+        placeholders = ", ".join("?" for _ in _LINK_FIELDS)
+        updates = ", ".join(f"{name} = excluded.{name}" for name in _LINK_FIELDS[1:])
+        self._exec(
+            f"INSERT INTO links ({', '.join(_LINK_FIELDS)}) VALUES ({placeholders})"
+            f" ON CONFLICT(sync_id) DO UPDATE SET {updates}",
+            tuple(values),
+        )
+        return link
+
+    def recent_links(self, limit: int = 50) -> list[Link]:
+        rows = self._exec("SELECT * FROM links ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
         return [self._link(r) for r in rows]
 
     @staticmethod
-    def _link(row: sqlite3.Row) -> ReservationLink:
-        return ReservationLink(
-            ontopo_id=row["ontopo_id"],
-            syrve_reserve_id=row["syrve_reserve_id"],
+    def _link(row: sqlite3.Row) -> Link:
+        return Link(
+            sync_id=row["sync_id"],
+            origin=row["origin"],
             state=row["state"],
+            ontopo_reservation_id=row["ontopo_reservation_id"],
+            ontopo_reservation=json.loads(row["ontopo_reservation"] or "{}"),
+            syrve_reserve_id=row["syrve_reserve_id"],
+            syrve_order_id=row["syrve_order_id"],
             fingerprint=row["fingerprint"],
-            start=row["start"],
+            start=datetime.fromisoformat(row["start"]) if row["start"] else None,
+            duration_minutes=row["duration_minutes"],
             party_size=row["party_size"],
             table_ids=json.loads(row["table_ids"] or "[]"),
+            order_digest=row["order_digest"],
             error=row["error"],
             updated_at=row["updated_at"],
         )

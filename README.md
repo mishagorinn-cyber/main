@@ -1,45 +1,70 @@
 # Syrve ↔ Ontopo connector
 
-Сервис-коннектор между кассовой системой **Syrve** (Syrve Cloud API) и платформой бронирования **Ontopo**.
+Сервис-коннектор между кассовой системой **Syrve** (Syrve Cloud API) и платформой бронирования **Ontopo**
+(по спецификации «Ontopo POS API Integration Specification»).
 
 | Направление | Что передаётся | Как |
 |---|---|---|
-| Syrve → Ontopo | Столы (зал, номер, вместимость) и **свободные столы по слотам времени** на N дней вперёд | Периодически (по умолчанию раз в 2 мин) и сразу после каждого изменения брони; отправляется только при изменениях |
-| Ontopo → Syrve | **Бронирования**: создание, изменение, отмена | Вебхук `POST /webhooks/ontopo` (+ опционально опрос API Ontopo); бронь создаётся в Syrve как резерв на конкретный стол |
+| Ontopo → Syrve | **Бронирования**: создание, перенос, отмена, no-show | Вебхук Ontopo → `POST /webhooks/ontopo` (+ страховочный опрос `/pos/reservationsForToday`) → резерв на стол в Syrve |
+| Syrve → Ontopo | **Занятость столов**: гости сели / оплатили, гости без брони (walk-in), назначенный стол | Заказы на столах Syrve → `POST /pos/setReservation` |
+
+В API Ontopo нет отдельной публикации «свободных столов»: Ontopo считает свободные столы сам, по своим броням и
+по заказам, которые передаёт POS. Поэтому коннектор отдаёт в Ontopo всё, что делает стол занятым или свободным:
+- открыт заказ на столе с бронью → бронь получает статус `seated`;
+- заказ оплачен → статус `done`, Ontopo освобождает стол;
+- заказ на столе без брони (гости с улицы) → в Ontopo создаётся запись от POS, стол виден занятым;
+- Syrve назначил стол под бронь → номер стола уходит в Ontopo.
 
 ```
-             ┌──────────────────── connector ────────────────────┐
- Syrve Cloud │  AvailabilitySync: столы + резервы → свободные    │  PUT availability
-   API  ◄────┤  слоты (по умолчанию шаг 15 мин, длительность 2 ч)├──────────────► Ontopo
-             │                                                   │
- reserve/    │  ReservationSync: inbox (SQLite) → подбор стола → │  webhook / poll
- create ◄────┤  reserve/create | reserve/cancel → статус в Ontopo│◄────────────── Ontopo
-             └───────────────────────────────────────────────────┘
+                 ┌─────────────────────────── connector ───────────────────────────┐
+  Ontopo webhook │ inbox (SQLite) → ReservationSync: подбор стола,                 │ reserve/create
+  SyncData  ────►│ reserve/create | reserve/cancel, перенос = новый резерв + отмена├──────────────► Syrve
+                 │                                                                 │
+  /pos/set-      │ OrderSync (каждые 30 c): order/by_table → seated / done /       │ order/by_table
+  Reservation ◄──┤ walk-in + данные заказа (стадия, сумма, позиции)                │◄────────────── Syrve
+                 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Как это работает
 
-### Свободные столы (Syrve → Ontopo)
-1. Из Syrve берутся залы и столы терминальной группы (`reserve/available_restaurant_sections`).
-2. Берутся все резервы/банкеты на горизонт `horizon_days` (`reserve/restaurant_sections_workload`).
-   Опционально (`consider_open_orders: true`) столы с открытыми заказами считаются занятыми прямо сейчас (гости без брони).
-3. Для каждого слота в часы работы считается, какие столы свободны на `default_duration_minutes`
-   с учётом буфера на уборку `buffer_minutes`.
-4. Результат (`tables` + `slots[].freeTableIds/freeSeats/maxPartySize`) отправляется в Ontopo, если он изменился.
+### Ontopo → Syrve
+1. Ontopo присылает `SyncData` на `POST /webhooks/ontopo`. Коннектор сохраняет запись в SQLite и сразу отвечает
+   `200` (так требует спецификация). Дальше запись обрабатывает фоновый обработчик.
+2. Ключ связи — `syncId`. Обработка идемпотентна: повторы и «эхо» собственных обновлений ничего не меняют.
 
-### Бронирования (Ontopo → Syrve)
-1. Вебхук проверяется (HMAC-SHA256) и **сначала сохраняется в SQLite** — ничего не теряется при падении Syrve или сети.
-2. Обработчик приводит Syrve к состоянию брони в Ontopo (идемпотентно, дубли безопасны):
-   * **новая** — подбирается стол: стол, указанный Ontopo (через `table_map`, номер или имя стола), иначе
-     самый маленький свободный стол, вмещающий гостей (опционально — объединение столов одного зала);
-     в Syrve создаётся резерв (`reserve/create`), подтверждение ждём через `reserve/status_by_id`;
-   * **изменённая** (время, гости, стол, контакты) — сначала создаётся новый резерв, потом отменяется старый,
-     по возможности на том же столе;
-   * **отменённая / no-show** — `reserve/cancel` с причиной `ClientRefused` / `ClientNotAppeared`.
-3. Результат сообщается в Ontopo (`confirmed` с назначенными столами или `rejected` с причиной).
-4. Сетевые ошибки и 5xx повторяются с экспоненциальной задержкой (`max_attempts`), затем событие попадает в
-   `/admin/events/failed`, откуда его можно перезапустить.
-5. После каждого изменения сразу пересчитываются свободные столы.
+| `reservation.status` | Действие в Syrve |
+|---|---|
+| `approved`, `seated` | создать резерв; при изменении даты, времени, длительности, числа гостей, стола, гостя или пожеланий — новый резерв, затем отмена старого |
+| `canceled` | отменить резерв (`ClientRefused`) |
+| `noShow` | отменить резерв (`ClientNotAppeared`) |
+| `standby` (лист ожидания) | снять резерв со стола (`Other`) |
+| `done` | ничего: резерв остаётся в истории |
+
+3. Стол выбирается так: сначала стол из `reservation.table` (через `table_map`, иначе по номеру, затем по названию
+   стола Syrve). Если такого стола нет или он занят — самый маленький свободный стол, на котором поместятся гости.
+   Объединение нескольких столов включается отдельно.
+4. Если стол выбрал Syrve, коннектор сообщает его в Ontopo (`setReservation` с тем же `syncId`).
+5. Сетевые ошибки и ошибки 5xx повторяются с растущей паузой (`max_attempts`). После этого событие видно
+   в `/admin/events/failed` и перезапускается через `/admin/events/retry`.
+6. Каждые 5 минут коннектор перечитывает `/pos/reservationsForToday` — на случай потерянного вебхука.
+
+### Syrve → Ontopo
+Раз в `orders.sync_interval_seconds` коннектор читает заказы на столах (`/api/1/order/by_table`) за последние 24 часа:
+- Заказ открыт на столе брони Ontopo в окне от «время брони − `early_arrival_minutes`» до её конца →
+  `setReservation` с `syncId` этой брони, `status: seated` и данными заказа.
+- Другие заказы (walk-in) создаются в Ontopo как записи от POS: новый `syncId` = `syrve-<id заказа>`, заказ и пустой
+  `reservation: {}`, как требует спецификация. Отключается параметром `create_walk_ins: false`.
+- Изменения заказа (стадия, сумма, позиции, столы) отправляются только при реальных изменениях.
+- Заказ закрыт → `stage: paid`, `status: done`. Удалённый walk-in-заказ → `status: canceled`.
+
+| Статус заказа Syrve | `order.stage` |
+|---|---|
+| `New` (есть позиции) | `ordered` |
+| `Bill` | `check` |
+| `Closed` | `paid` |
+
+Поле `order.tables` заполняется номерами столов Syrve. `netTotal` — это `sum` заказа, `discountAmount` — сумма скидок,
+`dinnersCount` — число гостей.
 
 ## Быстрый старт
 
@@ -49,114 +74,52 @@ pip install -e '.[dev]'
 cp config.example.yaml config.yaml
 cp .env.example .env            # заполнить, затем: set -a; . ./.env; set +a
 
-python -m connector discover              # показать организации, терминальные группы, залы и столы Syrve
-python -m connector preview-availability  # посмотреть, что уйдёт в Ontopo (ничего не отправляет)
-python -m connector serve                 # запустить сервис на :8080
+python -m connector discover       # организации, терминальные группы, залы и столы Syrve
+python -m connector ontopo-today   # брони Ontopo на сегодня (проверка API-ключа)
+python -m connector serve          # сервис на :8080
 ```
 
-Docker: `docker compose up -d --build` (берёт `config.yaml` и `.env` из текущей папки, база в `./data`).
+Docker: `docker compose up -d --build`. Контейнер берёт `config.yaml` и `.env` из текущей папки, база хранится в `./data`.
 
 Тесты: `pytest`.
 
-### Настройка Syrve
-1. В Syrve Office / веб-кабинете создайте **API-логин** для Syrve Cloud API и привяжите к нему организацию → `SYRVE_API_LOGIN`.
-2. Убедитесь, что на терминальной группе включены резервы/банкеты, а у столов задана вместимость.
-3. `python -m connector discover` покажет `organization_id`, `terminal_group_id` и id залов.
-4. Регион API: `https://api-eu.syrve.live` (EU). Для другого региона поменяйте `syrve.base_url`.
+### Что настроить
+**Syrve**
+1. Создайте API-логин Syrve Cloud API с доступом к организации → `SYRVE_API_LOGIN`.
+2. На терминальной группе должны быть включены резервы, у столов должна быть задана вместимость.
+3. Команда `python -m connector discover` покажет `organization_id` и `terminal_group_id`.
 
-### Настройка Ontopo
-У Ontopo нет публичной документации партнёрского API — доступ выдаётся по запросу партнёрам/интеграторам POS.
-Коннектор реализует контракт ниже; адреса, заголовок авторизации и путь подписи настраиваются в `config.yaml`,
-а все имена полей собраны в одном файле [`connector/ontopo/mapping.py`](connector/ontopo/mapping.py) —
-когда Ontopo пришлёт свою спецификацию, правки нужны только там.
-
-## Контракт с Ontopo
-
-**Авторизация исходящих запросов:** заголовок `Authorization: Bearer <ONTOPO_API_KEY>` (настраивается).
-
-### 1. Публикация свободных столов — `PUT {base_url}/venues/{venue_id}/availability`
-```json
-{
-  "venueId": "venue-1",
-  "source": "syrve",
-  "timezone": "Asia/Jerusalem",
-  "generatedAt": "2026-10-05T12:00:00+03:00",
-  "slotMinutes": 15,
-  "defaultDurationMinutes": 120,
-  "tables": [{"id": "…", "number": 5, "name": "5", "capacity": 4, "areaId": "…", "areaName": "Терраса"}],
-  "slots": [
-    {"start": "2026-10-05T19:00:00+03:00", "freeTableIds": ["…"], "freeSeats": 8, "maxPartySize": 6}
-  ]
-}
-```
-
-### 2. Вебхук бронирования — `POST {connector}/webhooks/ontopo`
-Подпись: `X-Ontopo-Signature: sha256=<hex HMAC-SHA256(тело запроса, ONTOPO_WEBHOOK_SECRET)>`.
-```json
-{
-  "event": "reservation.created",          // .updated | .cancelled
-  "reservation": {
-    "id": "R-123",
-    "status": "confirmed",                 // cancelled | no_show | … → отмена в Syrve
-    "start": "2026-10-05T19:00:00+03:00",
-    "durationMinutes": 120,                // необязательно (или "end")
-    "partySize": 4,
-    "guest": {"firstName": "Dana", "lastName": "Levi", "phone": "050-123-4567", "email": "…"},
-    "notes": "у окна",
-    "tableIds": ["A5"]                     // необязательно
-  }
-}
-```
-Принимаются и snake_case-варианты (`start_time`, `party_size`, `reservation_id`, `guests: {count}` …).
-Ответ: `202 {"accepted": true, "eventId": 1}`; `401` — неверная подпись; `400` — не JSON / нет id брони.
-
-### 3. Статус на стороне POS — `POST {base_url}/venues/{venue_id}/reservations/{reservation_id}/pos-status`
-```json
-{"reservationId": "R-123", "status": "confirmed", "posReservationId": "<syrve id>",
- "tables": [{"id": "…", "name": "5", "number": 5}], "message": null}
-```
-Отключается пустым `reservation_status_path`.
-
-### 4. (Опционально) опрос броней — `GET {base_url}/venues/{venue_id}/reservations?updatedSince=<ISO>`
-Включается `poll_reservations: true` — страховка на случай потерянных вебхуков.
-Ответ — массив броней или `{"reservations": [...]}`.
+**Ontopo**
+1. Получите у Ontopo API-ключ заведения → `ONTOPO_API_KEY` (передаётся в заголовке `x-api-key`).
+2. Сейчас используется staging: `https://top-openapi.staging-01.ontopo.cz`. Для продакшена укажите `ONTOPO_BASE_URL`
+   (в спецификации адрес пока не указан).
+3. Передайте Ontopo адрес вебхука: `https://<ваш-хост>/webhooks/ontopo?token=<ONTOPO_WEBHOOK_TOKEN>`.
+   Спецификация не описывает подпись вебхуков, поэтому защита сделана секретным токеном в URL
+   (также принимается заголовок `x-api-key`).
+4. Номера столов в Ontopo должны совпадать с номерами столов Syrve. Если не совпадают, задайте
+   `reservations.table_map`.
 
 ## HTTP API коннектора
 
 | Метод | Путь | Назначение |
 |---|---|---|
 | GET | `/health` | проверка живости |
-| POST | `/webhooks/ontopo` | приём броней из Ontopo |
-| GET | `/status` | время последней публикации, ошибки, счётчики очереди |
-| GET | `/admin/availability/preview` | текущий расчёт свободных столов |
-| POST | `/admin/sync/availability` | принудительно отправить свободные столы |
-| GET | `/admin/reservations` | соответствие броней Ontopo ↔ резервов Syrve |
+| POST | `/webhooks/ontopo` | приём `SyncData` от Ontopo |
+| GET | `/status` | последняя синхронизация заказов и опроса, ошибки, очередь |
+| GET | `/admin/links` | связи `syncId` ↔ резерв/заказ Syrve |
 | GET | `/admin/events/failed` | события, которые не удалось обработать |
 | POST | `/admin/events/retry` | перезапустить их |
+| POST | `/admin/sync/orders` | отправить заказы в Ontopo сейчас |
+| POST | `/admin/sync/reservations` | перечитать брони Ontopo сейчас |
 
-`/status` и `/admin/*` требуют заголовок `X-Admin-Token`, если задан `server.admin_token`.
+Если задан `server.admin_token`, для `/status` и `/admin/*` нужен заголовок `X-Admin-Token`.
 
-## Настройки (`config.yaml`)
-
-| Ключ | По умолчанию | Описание |
-|---|---|---|
-| `timezone` | `Asia/Jerusalem` | часовой пояс ресторана (Syrve хранит локальное время) |
-| `syrve.restaurant_section_ids` | `[]` | какие залы публиковать (пусто — все) |
-| `syrve.consider_open_orders` | `false` | считать занятыми столы с открытыми заказами |
-| `availability.horizon_days` | `14` | на сколько дней вперёд публиковать |
-| `availability.slot_minutes` | `15` | шаг слотов |
-| `availability.default_duration_minutes` | `120` | на сколько занимается стол при посадке |
-| `availability.buffer_minutes` | `15` | буфер между бронями |
-| `availability.last_seating_offset_minutes` | `60` | последняя посадка за N минут до закрытия |
-| `availability.opening_hours` | 12:00–23:00 | часы по дням (`default`, `mon`…`sun`, `null` — выходной; время в кавычках) |
-| `reservations.table_map` | `{}` | id стола Ontopo → id стола Syrve |
-| `reservations.auto_assign_tables` | `true` | подбирать стол, если Ontopo его не указал или он занят |
-| `reservations.allow_table_combining` | `false` | объединять столы одного зала для больших компаний |
-
-## Ограничения и допущения
-* Изменение брони реализовано как «создать новый резерв → отменить старый» — используются только
-  стабильные методы Syrve Cloud API (`reserve/create`, `reserve/cancel`, `reserve/status_by_id`).
-* Если терминал Syrve офлайн, резерв остаётся в статусе `InProgress` и будет доставлен Syrve позже;
-  коннектор считает его созданным.
-* Телефоны приводятся к международному формату; номера, начинающиеся с `0`, считаются израильскими (`+972`).
-* Брони, созданные в самом Syrve (по телефону, в зале), автоматически попадают в публикуемую занятость.
+## Ограничения и открытые вопросы к Ontopo
+- **Брони, созданные в самом Syrve** (по телефону), в Ontopo не передаются: по спецификации POS может создать запись
+  только вместе с заказом. Стол станет занятым в Ontopo, когда гости сядут и откроется заказ. Если Ontopo
+  разрешит создавать брони без заказа, это добавляется в `connector/orders.py`.
+- В спецификации не описан объект `patron`. Коннектор понимает `firstName`/`lastName`/`name`, `phone`, `email`.
+- Перенос брони в Syrve сделан как «новый резерв → отмена старого», потому что используются только
+  `reserve/create`, `reserve/cancel` и `reserve/status_by_id`.
+- Если терминал Syrve офлайн, резерв остаётся в статусе `InProgress`. Syrve доставит его позже.
+- Телефоны приводятся к международному формату; номера, начинающиеся с `0`, считаются израильскими (`+972`).

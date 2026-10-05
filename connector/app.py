@@ -1,16 +1,15 @@
-"""HTTP API: Ontopo webhooks, health and admin endpoints."""
+"""HTTP API: the Ontopo webhook, health and admin endpoints."""
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 
 from .config import Settings, load_settings
-from .ontopo.client import verify_signature
 from .ontopo.mapping import PayloadError
 from .service import Connector
 
@@ -24,8 +23,8 @@ def create_app(settings: Settings | None = None, connector: Connector | None = N
     async def lifespan(app: FastAPI):
         conn = connector or Connector(settings)
         app.state.connector = conn
-        if not settings.ontopo.webhook_secret:
-            log.warning("ontopo.webhook_secret is empty: webhook signatures are NOT verified")
+        if not settings.ontopo.webhook_token:
+            log.warning("ontopo.webhook_token is empty: the webhook accepts requests from anyone")
         if run_background:
             conn.start()
         try:
@@ -33,7 +32,7 @@ def create_app(settings: Settings | None = None, connector: Connector | None = N
         finally:
             await conn.stop()
 
-    app = FastAPI(title="Syrve ↔ Ontopo connector", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Syrve ↔ Ontopo connector", version="0.2.0", lifespan=lifespan)
 
     def get_connector(request: Request) -> Connector:
         return request.app.state.connector
@@ -42,40 +41,36 @@ def create_app(settings: Settings | None = None, connector: Connector | None = N
         if settings.server.admin_token and x_admin_token != settings.server.admin_token:
             raise HTTPException(status_code=401, detail="invalid admin token")
 
+    def check_webhook_token(request: Request) -> None:
+        expected = settings.ontopo.webhook_token
+        if not expected:
+            return
+        given = request.query_params.get("token") or request.headers.get("x-api-key") or ""
+        if not hmac.compare_digest(given.encode(), expected.encode()):
+            raise HTTPException(status_code=401, detail="invalid webhook token")
+
     @app.get("/health")
     async def health() -> dict:
         return {"status": "ok"}
 
-    @app.post("/webhooks/ontopo", status_code=202)
+    @app.post("/webhooks/ontopo", dependencies=[Depends(check_webhook_token)])
     async def ontopo_webhook(request: Request, conn: Connector = Depends(get_connector)) -> dict:
-        body = await request.body()
-        secret = settings.ontopo.webhook_secret
-        if secret and not verify_signature(secret, body, request.headers.get(settings.ontopo.webhook_signature_header)):
-            raise HTTPException(status_code=401, detail="invalid signature")
+        """Receives SyncData from Ontopo. The spec requires an immediate 200: the record is
+        only stored here and applied to Syrve by the background worker."""
         try:
-            payload = json.loads(body)
-            event_id = conn.reservations.accept_webhook(payload)
+            event_id = conn.reservations.accept(json.loads(await request.body()), source="webhook")
         except (ValueError, PayloadError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         conn.request_inbox_processing()
-        return {"accepted": True, "eventId": event_id}
+        return {"ok": True, "eventId": event_id}
 
     @app.get("/status", dependencies=[Depends(require_admin)])
     async def status(conn: Connector = Depends(get_connector)) -> dict:
         return conn.status()
 
-    @app.post("/admin/sync/availability", dependencies=[Depends(require_admin)])
-    async def sync_availability(conn: Connector = Depends(get_connector)) -> dict:
-        pushed = await conn.availability.run(force=True)
-        return {"pushed": pushed}
-
-    @app.get("/admin/availability/preview", dependencies=[Depends(require_admin)])
-    async def preview_availability(conn: Connector = Depends(get_connector)) -> dict:
-        return await conn.availability.build_payload(refresh_tables=True)
-
-    @app.get("/admin/reservations", dependencies=[Depends(require_admin)])
-    async def reservations(limit: int = 50, conn: Connector = Depends(get_connector)) -> list[dict]:
-        return [asdict(link) for link in conn.store.recent_links(limit)]
+    @app.get("/admin/links", dependencies=[Depends(require_admin)])
+    async def links(limit: int = 50, conn: Connector = Depends(get_connector)) -> list[dict]:
+        return [link.to_dict() for link in conn.store.recent_links(limit)]
 
     @app.get("/admin/events/failed", dependencies=[Depends(require_admin)])
     async def failed_events(conn: Connector = Depends(get_connector)) -> list[dict]:
@@ -86,5 +81,13 @@ def create_app(settings: Settings | None = None, connector: Connector | None = N
         count = conn.store.retry_failed()
         conn.request_inbox_processing()
         return {"requeued": count}
+
+    @app.post("/admin/sync/orders", dependencies=[Depends(require_admin)])
+    async def sync_orders(conn: Connector = Depends(get_connector)) -> dict:
+        return {"sent": await conn.sync_orders_once()}
+
+    @app.post("/admin/sync/reservations", dependencies=[Depends(require_admin)])
+    async def sync_reservations(conn: Connector = Depends(get_connector)) -> dict:
+        return {"queued": await conn.poll_ontopo_once()}
 
     return app

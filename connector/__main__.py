@@ -1,4 +1,4 @@
-"""Command line: serve | discover | preview-availability | sync-availability."""
+"""Command line: serve | discover | ontopo-today | sync-orders."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the webhook server and background sync")
     sub.add_parser("discover", help="list Syrve organizations, terminal groups, sections and tables")
-    sub.add_parser("preview-availability", help="print the availability payload without sending it")
-    sub.add_parser("sync-availability", help="push availability to Ontopo once")
+    sub.add_parser("ontopo-today", help="print today's reservations from Ontopo (checks the API key)")
+    sub.add_parser("sync-orders", help="send Syrve table orders to Ontopo once")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -35,10 +35,10 @@ def main() -> None:
         uvicorn.run(create_app(settings), host=settings.server.host, port=settings.server.port)
     elif args.command == "discover":
         asyncio.run(_discover(settings))
-    elif args.command == "preview-availability":
-        asyncio.run(_preview(settings))
-    elif args.command == "sync-availability":
-        asyncio.run(_sync(settings))
+    elif args.command == "ontopo-today":
+        asyncio.run(_ontopo_today(settings))
+    elif args.command == "sync-orders":
+        asyncio.run(_sync_orders(settings))
 
 
 async def _discover(settings) -> None:
@@ -69,24 +69,22 @@ async def _discover(settings) -> None:
         await syrve.aclose()
 
 
-async def _preview(settings) -> None:
-    from .service import Connector
+async def _ontopo_today(settings) -> None:
+    from .ontopo.client import OntopoClient
 
-    conn = Connector(settings)
+    ontopo = OntopoClient(settings.ontopo)
     try:
-        payload = await conn.availability.build_payload(refresh_tables=True)
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print(json.dumps(await ontopo.reservations_for_today(), ensure_ascii=False, indent=2))
     finally:
-        await conn.stop()
+        await ontopo.aclose()
 
 
-async def _sync(settings) -> None:
+async def _sync_orders(settings) -> None:
     from .service import Connector
 
     conn = Connector(settings)
     try:
-        pushed = await conn.availability.run(force=True)
-        print("pushed" if pushed else "unchanged")
+        print(f"sent {await conn.sync_orders_once()} update(s)")
     finally:
         await conn.stop()
 
